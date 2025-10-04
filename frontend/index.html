@@ -1,0 +1,70 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Gemini Class Assistant</title>
+    <link rel="stylesheet" href="style.css">
+    <!-- Google Fonts for a clean look -->
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=Roboto:wght@300;400;700&display=swap" rel="stylesheet">
+</head>
+<body>
+    <div class="container">
+        <!-- Cost Banner -->
+        <div id="cost-banner" class="banner warning">
+            ⚠️ **API Usage Costs Apply:** This application uses the Google Gemini API, which incurs costs based on usage. Please be mindful of your API key's associated billing.
+        </div>
+
+        <h1>Gemini Class Assistant</h1>
+        <p>Upload an audio recording of your class (MP3 or WAV, max 15 mins) and let Gemini help you generate notes, flashcards, and quizzes.</p>
+
+        <!-- File Upload Area -->
+        <div id="drop-area" class="drop-area">
+            <input type="file" id="audio-file-input" accept=".mp3,.wav" hidden />
+            <p>Drag & Drop your audio file here, or <span id="file-browse-btn">click to browse</span></p>
+            <p id="file-name" class="file-name"></p>
+            <button id="clear-audio-btn" class="secondary-button hidden">Clear Audio</button> <!-- NEW BUTTON -->
+        </div>
+
+        <!-- Processing Controls -->
+        <div class="controls">
+            <button id="generate-notes-btn" disabled>Generate Notes & Summary</button>
+            <button id="generate-flashcards-btn" disabled>Generate Flashcards</button>
+            <button id="generate-quizzes-btn" disabled>Generate Quizzes</button>
+        </div>
+
+        <!-- Loading Indicator -->
+        <div id="loading-area" class="loading-area hidden">
+            <div class="spinner"></div>
+            <p id="loading-message">Processing your audio...</p>
+            <p class="small-text">Estimated time: ~1-3 minutes for a 15 min audio (depending on content complexity)</p>
+        </div>
+
+        <!-- Output Areas -->
+        <div id="notes-output" class="output-card hidden">
+            <h2>Generated Notes</h2>
+            <textarea id="notes-content" readonly></textarea>
+            <button id="download-notes-btn" class="download-button">Download Notes (.txt)</button>
+        </div>
+
+        <!-- Error/Success Pop-up (Modal) -->
+        <div id="modal" class="modal hidden">
+            <div class="modal-content">
+                <span class="close-button">&times;</span>
+                <h3 id="modal-title"></h3>
+                <p id="modal-message"></p>
+                <!-- Flashcard/Quiz specific content will be injected here -->
+                <div id="modal-body-content"></div>
+                <div id="modal-navigation" class="modal-navigation hidden">
+                    <button id="prev-btn">Previous</button>
+                    <button id="next-btn">Next</button>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <script src="script.js"></script>
+</body>
+</html>
