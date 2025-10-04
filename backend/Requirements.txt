@@ -1,0 +1,6 @@
+Flask
+google-generativeai
+python-dotenv
+pydub
+Flask-Cors
+google-cloud-speech
