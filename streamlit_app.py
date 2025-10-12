@@ -32,7 +32,7 @@ except Exception as e:
 load_dotenv()  # allow .env fallback if user put GEMINI_API_KEY there
 
 # Configurable parameters
-CHUNK_MS = int(os.environ.get("CHUNK_MS_MS", 5 * 60 * 1000))  # default 5 minutes per chunk
+CHUNK_MS = int(os.environ.get("CHUNK_MS_MS", 15 * 60 * 1000))  # default 5 minutes per chunk
 CHUNK_OVERLAP_MS = int(os.environ.get("CHUNK_OVERLAP_MS", 5000))  # 5s overlap
 MIN_FINAL_CHUNK_MS = int(os.environ.get("MIN_FINAL_CHUNK_MS", 30 * 1000))  # 30s min before merging
 MAX_ALLOWED_MINUTES = int(os.environ.get("MAX_ALLOWED_MINUTES", 60))
@@ -263,7 +263,7 @@ Chunk summaries:
 # ---------- Streamlit UI ----------
 
 st.set_page_config(page_title="Gemini Class Assistant (Streamlit)", layout="centered")
-st.title("Gemini Class Assistant — Streamlit (All-in-one)")
+st.title("Gemini Class Assistant")
 
 st.markdown(
     f"**Chunk size:** {CHUNK_MS//1000//60} min  **Overlap:** {CHUNK_OVERLAP_MS/1000:.0f}s  **Max:** {MAX_ALLOWED_MINUTES} min"
@@ -377,4 +377,3 @@ if uploaded is not None:
 st.markdown("---")
 st.write("Notes:")
 st.write("- This app performs multiple network/model calls and may take minutes for long recordings.")
-st.write("- Cache lives in `./cache/<sha256>/` on the host. Remove a folder to re-run processing from scratch.")
