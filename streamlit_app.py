@@ -262,14 +262,49 @@ Chunk summaries:
 
 # ---------- Streamlit UI ----------
 
+# ---------- Streamlit UI (robust to reruns) ----------
 st.set_page_config(page_title="Gemini Class Assistant (Streamlit)", layout="centered")
 st.title("Gemini Class Assistant")
+
+# small debug info so we can see whether key & genai are present
+st.sidebar.markdown("### Debug")
+st.sidebar.write(f"GEMINI_KEY present: {bool(GEMINI_KEY)}")
+st.sidebar.write(f"google-generativeai imported: {genai is not None}")
 
 st.markdown(
     f"**Chunk size:** {CHUNK_MS//1000//60} min  **Overlap:** {CHUNK_OVERLAP_MS/1000:.0f}s  **Max:** {MAX_ALLOWED_MINUTES} min"
 )
 
+# file uploader (store content into session_state so it survives reruns)
 uploaded = st.file_uploader("Upload MP3/WAV lecture (≤ {} min)".format(MAX_ALLOWED_MINUTES), type=["mp3", "wav"])
+
+# If a fresh upload happened, read bytes and store them in session_state
+if uploaded is not None:
+    try:
+        uploaded_bytes = uploaded.read()
+        st.session_state['uploaded_bytes'] = uploaded_bytes
+        st.session_state['uploaded_name'] = uploaded.name
+        st.success(f"Loaded file: {uploaded.name}")
+    except Exception as e:
+        st.error(f"Failed to read uploaded file: {e}")
+
+# If session_state already has uploaded file, use it
+uploaded_bytes = st.session_state.get('uploaded_bytes', None)
+uploaded_name = st.session_state.get('uploaded_name', None)
+
+# show file info and validate (but don't block UI creation)
+if uploaded_bytes:
+    ok, dur_or_err = validate_audio_bytes(uploaded_bytes, uploaded_name)
+    if not ok:
+        st.error(dur_or_err)
+        # if invalid, clear the session state so user can reupload
+        st.session_state.pop('uploaded_bytes', None)
+        st.session_state.pop('uploaded_name', None)
+        uploaded_bytes = None
+        uploaded_name = None
+    else:
+        minutes = dur_or_err / 60.0
+        st.info(f"File OK — {uploaded_name} — duration {minutes:.2f} minutes")
 
 # Session UI elements for progress and status
 progress_bar = st.progress(0)
@@ -280,98 +315,121 @@ def progress_cb(text, pct):
     progress_text.text(text)
     progress_bar.progress(min(max(int(pct), 0), 100))
 
-if uploaded is not None:
-    uploaded_bytes = uploaded.read()
-    ok, dur_or_err = validate_audio_bytes(uploaded_bytes, uploaded.name)
-    if not ok:
-        st.error(dur_or_err)
-    else:
-        minutes = dur_or_err / 60.0
-        st.info(f"File OK — duration {minutes:.2f} minutes")
-        # options
-        col1, col2, col3 = st.columns(3)
-        if col1.button("Generate Notes"):
-            # run pipeline
-            with st.spinner("Processing... (this may take some minutes)"):
-                try:
-                    audio_hash, cache_path, transcript_text, chunk_summaries = prepare_transcript_and_summaries_from_bytes(
-                        uploaded_bytes, uploaded.name, progress_callback=progress_cb
-                    )
-                    # check cache for notes
-                    notes_cached = read_cache_text(cache_path, "notes.txt")
-                    model = get_gemini_model()
-                    if notes_cached:
-                        result_area.text_area("Notes (cached)", value=notes_cached, height=360)
-                        st.success("Notes returned from cache")
-                    else:
-                        progress_cb("Synthesizing final notes...", 95)
-                        notes = synthesize_notes_from_summaries(model, chunk_summaries)
-                        write_cache_text(cache_path, "notes.txt", notes)
-                        progress_cb("Done", 100)
-                        result_area.text_area("Notes", value=notes, height=360)
-                except Exception as e:
-                    st.error(f"Failed to generate notes: {e}")
+# Show the action buttons even if file not present (buttons disabled when no file)
+col1, col2, col3 = st.columns(3)
 
-        if col2.button("Generate Flashcards"):
-            with st.spinner("Processing..."):
-                try:
-                    audio_hash, cache_path, transcript_text, chunk_summaries = prepare_transcript_and_summaries_from_bytes(
-                        uploaded_bytes, uploaded.name, progress_callback=progress_cb
-                    )
-                    flash_cached = read_cache_text(cache_path, "flashcards.json")
-                    model = get_gemini_model()
-                    if flash_cached:
-                        flashcards = json.loads(flash_cached)
-                        st.success("Flashcards returned from cache")
-                    else:
-                        progress_cb("Generating flashcards...", 95)
-                        flashcards = generate_flashcards_from_summaries(model, chunk_summaries)
-                        write_cache_text(cache_path, "flashcards.json", json.dumps(flashcards, ensure_ascii=False, indent=2))
-                        progress_cb("Done", 100)
-                    # display
-                    if flashcards:
-                        for i, fc in enumerate(flashcards, start=1):
-                            st.markdown(f"**{i}. {fc.get('front','(no front)')}**")
-                            st.write(fc.get("back","(no back)"))
-                    else:
-                        st.warning("No flashcards generated.")
-                except Exception as e:
-                    st.error(f"Failed to generate flashcards: {e}")
+# Helper to check whether streamlit version supports disabled parameter:
+_supports_disabled = True
+try:
+    # try creating a disabled button in a try/except to detect support
+    _temp = col1.button("___", disabled=True)
+except TypeError:
+    _supports_disabled = False
 
-        if col3.button("Generate Quizzes"):
-            with st.spinner("Processing..."):
-                try:
-                    audio_hash, cache_path, transcript_text, chunk_summaries = prepare_transcript_and_summaries_from_bytes(
-                        uploaded_bytes, uploaded.name, progress_callback=progress_cb
-                    )
-                    quiz_cached = read_cache_text(cache_path, "quiz.json")
-                    model = get_gemini_model()
-                    if quiz_cached:
-                        quiz = json.loads(quiz_cached)
-                        st.success("Quiz returned from cache")
-                    else:
-                        progress_cb("Generating quiz questions...", 95)
-                        quiz = generate_quiz_from_summaries(model, chunk_summaries)
-                        write_cache_text(cache_path, "quiz.json", json.dumps(quiz, ensure_ascii=False, indent=2))
-                        progress_cb("Done", 100)
-                    # display
-                    if quiz:
-                        for i, q in enumerate(quiz, start=1):
-                            st.markdown(f"**Q{i}. {q.get('question','(no question)')}**")
-                            choices = q.get('choices') or q.get('options') or q.get('answers') or {}
-                            if isinstance(choices, dict):
-                                for k, v in choices.items():
-                                    st.write(f"- {k}: {v}")
-                            elif isinstance(choices, list):
-                                for idx, val in enumerate(choices):
-                                    st.write(f"- {chr(65+idx)}: {val}")
-                            else:
-                                st.write("No choices available.")
-                    else:
-                        st.warning("No quiz questions generated.")
+# Generate Notes
+if _supports_disabled:
+    gen_notes_clicked = col1.button("Generate Notes", disabled=(uploaded_bytes is None))
+else:
+    gen_notes_clicked = col1.button("Generate Notes")
+    if gen_notes_clicked and uploaded_bytes is None:
+        st.warning("Please upload a valid audio file first.")
+        gen_notes_clicked = False
 
-                except Exception as e:
-                    st.error(f"Failed to generate quiz: {e}")
+if gen_notes_clicked:
+    with st.spinner("Processing notes... this may take some minutes"):
+        try:
+            audio_hash, cache_path, transcript_text, chunk_summaries = prepare_transcript_and_summaries_from_bytes(
+                uploaded_bytes, uploaded_name, progress_callback=progress_cb
+            )
+            notes_cached = read_cache_text(cache_path, "notes.txt")
+            model = get_gemini_model()
+            if notes_cached:
+                result_area.text_area("Notes (cached)", value=notes_cached, height=360)
+                st.success("Notes returned from cache")
+            else:
+                progress_cb("Synthesizing final notes...", 95)
+                notes = synthesize_notes_from_summaries(model, chunk_summaries)
+                write_cache_text(cache_path, "notes.txt", notes)
+                progress_cb("Done", 100)
+                result_area.text_area("Notes", value=notes, height=360)
+        except Exception as e:
+            st.error(f"Failed to generate notes: {e}")
+
+# Generate Flashcards
+if _supports_disabled:
+    gen_flash_clicked = col2.button("Generate Flashcards", disabled=(uploaded_bytes is None))
+else:
+    gen_flash_clicked = col2.button("Generate Flashcards")
+    if gen_flash_clicked and uploaded_bytes is None:
+        st.warning("Please upload a valid audio file first.")
+        gen_flash_clicked = False
+
+if gen_flash_clicked:
+    with st.spinner("Processing flashcards..."):
+        try:
+            audio_hash, cache_path, transcript_text, chunk_summaries = prepare_transcript_and_summaries_from_bytes(
+                uploaded_bytes, uploaded_name, progress_callback=progress_cb
+            )
+            flash_cached = read_cache_text(cache_path, "flashcards.json")
+            model = get_gemini_model()
+            if flash_cached:
+                flashcards = json.loads(flash_cached)
+                st.success("Flashcards returned from cache")
+            else:
+                progress_cb("Generating flashcards...", 95)
+                flashcards = generate_flashcards_from_summaries(model, chunk_summaries)
+                write_cache_text(cache_path, "flashcards.json", json.dumps(flashcards, ensure_ascii=False, indent=2))
+                progress_cb("Done", 100)
+            if flashcards:
+                for i, fc in enumerate(flashcards, start=1):
+                    st.markdown(f"**{i}. {fc.get('front','(no front)')}**")
+                    st.write(fc.get("back","(no back)"))
+            else:
+                st.warning("No flashcards generated.")
+        except Exception as e:
+            st.error(f"Failed to generate flashcards: {e}")
+
+# Generate Quizzes
+if _supports_disabled:
+    gen_quiz_clicked = col3.button("Generate Quizzes", disabled=(uploaded_bytes is None))
+else:
+    gen_quiz_clicked = col3.button("Generate Quizzes")
+    if gen_quiz_clicked and uploaded_bytes is None:
+        st.warning("Please upload a valid audio file first.")
+        gen_quiz_clicked = False
+
+if gen_quiz_clicked:
+    with st.spinner("Processing quiz..."):
+        try:
+            audio_hash, cache_path, transcript_text, chunk_summaries = prepare_transcript_and_summaries_from_bytes(
+                uploaded_bytes, uploaded_name, progress_callback=progress_cb
+            )
+            quiz_cached = read_cache_text(cache_path, "quiz.json")
+            model = get_gemini_model()
+            if quiz_cached:
+                quiz = json.loads(quiz_cached)
+                st.success("Quiz returned from cache")
+            else:
+                progress_cb("Generating quiz questions...", 95)
+                quiz = generate_quiz_from_summaries(model, chunk_summaries)
+                write_cache_text(cache_path, "quiz.json", json.dumps(quiz, ensure_ascii=False, indent=2))
+                progress_cb("Done", 100)
+            if quiz:
+                for i, q in enumerate(quiz, start=1):
+                    st.markdown(f"**Q{i}. {q.get('question','(no question)')}**")
+                    choices = q.get('choices') or q.get('options') or q.get('answers') or {}
+                    if isinstance(choices, dict):
+                        for k, v in choices.items():
+                            st.write(f"- {k}: {v}")
+                    elif isinstance(choices, list):
+                        for idx, val in enumerate(choices):
+                            st.write(f"- {chr(65+idx)}: {val}")
+                    else:
+                        st.write("No choices available.")
+            else:
+                st.warning("No quiz questions generated.")
+        except Exception as e:
+            st.error(f"Failed to generate quiz: {e}")
 
 # Footer / tips
 st.markdown("---")
