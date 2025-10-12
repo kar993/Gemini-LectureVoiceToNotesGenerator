@@ -1,305 +1,330 @@
 import os
 import io
-from flask import Flask, request, jsonify, send_from_directory
-from flask_cors import CORS # Needed for cross-origin requests from frontend
+import json
+import time
+import math
+import hashlib
+from pathlib import Path
+from flask import Flask, request, jsonify
+from flask_cors import CORS
 from dotenv import load_dotenv
 import google.generativeai as genai
-from pydub import AudioSegment # For audio processing utilities if needed
+from pydub import AudioSegment
 
-# Load environment variables from .env file
+# --- Configuration ---
 load_dotenv()
+GEMINI_KEY = os.getenv("GEMINI_API_KEY")
+if not GEMINI_KEY:
+    raise RuntimeError("GEMINI_API_KEY environment variable is required")
+
+genai.configure(api_key=GEMINI_KEY)
+
+CACHE_DIR = Path("./cache")
+CACHE_DIR.mkdir(parents=True, exist_ok=True)
+
+# Tune these
+MAX_ALLOWED_MINUTES = 60  # allow up to 60 minutes
+CHUNK_MS = 15 * 60 * 1000  # 15 minutes per chunk (in ms)
+TRANSCRIBE_PAUSE = 0.2  # seconds between chunk transcriptions to be polite to API
 
 app = Flask(__name__)
-# Allow CORS for all origins, necessary for local frontend development
-# In a production environment, you would restrict this to your frontend's domain.
 CORS(app)
 
-# Configure Gemini API
-# This will raise an error if GEMINI_API_KEY is not set
-genai.configure(api_key=os.getenv("GEMINI_API_KEY"))
-
-# Define a function to initialize the Gemini model
 def get_gemini_model():
-    """Initializes and returns the Gemini Pro Vision (gemini-2.0-flash) model for multimodal input."""
-    return genai.GenerativeModel('gemini-2.0-flash')
+    return genai.GenerativeModel("gemini-2.0-flash")
 
-# --- Helper Functions ---
+# ---------- Utilities ----------
+
+def sha256_bytes(b: bytes) -> str:
+    h = hashlib.sha256()
+    h.update(b)
+    return h.hexdigest()
+
+def make_cache_path(audio_hash: str) -> Path:
+    p = CACHE_DIR / audio_hash
+    p.mkdir(parents=True, exist_ok=True)
+    return p
+
+def read_cache_file(cache_path: Path, name: str):
+    f = cache_path / name
+    if f.exists():
+        return f.read_bytes() if name.endswith((".wav", ".bin")) else f.read_text(encoding="utf-8")
+    return None
+
+def write_cache_file(cache_path: Path, name: str, data, binary: bool = False):
+    f = cache_path / name
+    if binary:
+        f.write_bytes(data)
+    else:
+        f.write_text(data, encoding="utf-8")
 
 def validate_audio_file(file_stream, filename):
-    """
-    Validates audio file type and duration.
-    Returns (True, None) if valid, or (False, error_message) if invalid.
-    """
     if not filename:
         return False, "No file uploaded."
-
-    # Validate file extension
-    ext = filename.rsplit('.', 1)[1].lower()
+    parts = filename.rsplit('.', 1)
+    if len(parts) < 2:
+        return False, "Uploaded file has no extension."
+    ext = parts[1].lower()
     if ext not in ['mp3', 'wav']:
         return False, f"Unsupported file type: .{ext}. Only MP3 and WAV are allowed."
-
     try:
-        # Use pydub to load audio and check duration
-        # Rewind the stream before passing to AudioSegment
         file_stream.seek(0)
-        audio = AudioSegment.from_file(file_stream, format=ext)
-        duration_minutes = len(audio) / (1000 * 60) # duration in milliseconds
-
-        if duration_minutes > 15:
-            return False, f"Audio file is too long ({duration_minutes:.2f} mins). Maximum allowed is 15 minutes."
-
-        # Rewind the stream again so it can be read by Gemini API later
+        file_bytes = io.BytesIO(file_stream.read())
+        audio = AudioSegment.from_file(file_bytes, format=ext)
+        duration_minutes = len(audio) / (1000 * 60)
+        if duration_minutes > MAX_ALLOWED_MINUTES:
+            return False, f"Audio file is too long ({duration_minutes:.2f} mins). Maximum allowed is {MAX_ALLOWED_MINUTES} minutes."
         file_stream.seek(0)
         return True, None
     except Exception as e:
         return False, f"Could not process audio file: {str(e)}"
 
-# --- API Endpoints ---
+def split_audio_into_chunks(audio_segment: AudioSegment, chunk_ms: int = CHUNK_MS):
+    total_ms = len(audio_segment)
+    chunks = []
+    num_chunks = math.ceil(total_ms / chunk_ms)
+    for i in range(num_chunks):
+        start = i * chunk_ms
+        end = min((i + 1) * chunk_ms, total_ms)
+        chunk = audio_segment[start:end]
+        buf = io.BytesIO()
+        # export as WAV for reliable transcription
+        chunk.export(buf, format="wav")
+        buf.seek(0)
+        chunks.append(buf.read())
+    return chunks
 
-@app.route('/upload_audio', methods=['POST'])
-def upload_audio():
-    if 'audio' not in request.files:
-        return jsonify({"error": "No audio file provided"}), 400
+# ---------- Model interaction helpers ----------
 
-    audio_file = request.files['audio']
-    filename = audio_file.filename
+def transcribe_chunk(model, chunk_bytes, idx):
+    """
+    Send one audio chunk to Gemini for transcription. Returns string transcript.
+    """
+    audio_part = {"mime_type": "audio/wav", "data": chunk_bytes}
+    transcribe_prompt = "Transcribe the audio to clear English text only. Preserve words and punctuation; do not add commentary."
+    try:
+        resp = model.generate_content([transcribe_prompt, audio_part])
+        return (resp.text or "").strip()
+    except Exception as e:
+        return f"[UNTRANSCRIBED CHUNK {idx+1}: error {str(e)}]"
 
-    is_valid, error_msg = validate_audio_file(audio_file.stream, filename)
-    if not is_valid:
-        return jsonify({"error": error_msg}), 400
+def summarize_chunk_text(model, chunk_transcript, idx):
+    """
+    Summarize a chunk transcript into 1-3 concise sentences.
+    """
+    prompt = f"""
+You are an assistant that produces concise chunk-level summaries for study.
+Summarize the following chunk transcript in 1-3 short sentences that capture the main points and any important terminology.
 
-    # At this point, the file is validated and its stream is rewound.
-    # You can now read audio_file.stream.read() to get the bytes
-    # or pass audio_file.stream directly to Gemini.
+Chunk transcript:
+{chunk_transcript}
+"""
+    try:
+        resp = model.generate_content([prompt])
+        return (resp.text or "").strip()
+    except Exception as e:
+        return f"[UNSUMMARIZED CHUNK {idx+1}: error {str(e)}]"
 
-    # For demonstration, let's just confirm upload and prepare for further processing
-    # In a real scenario, you'd store this or pass it to Gemini immediately.
-    return jsonify({
-        "message": f"Audio file '{filename}' uploaded and validated successfully.",
-        "filename": filename,
-        "size": audio_file.content_length,
-        # In a real scenario, you might return a session ID or path to processed audio
-    }), 200
+# ---------- High-level pipeline ----------
 
-@app.route('/generate_notes', methods=['POST'])
+def prepare_transcript_and_summaries(audio_file):
+    """
+    Given werkzeug FileStorage audio_file:
+     - compute hash
+     - if transcript exists in cache -> load chunk_summaries and transcript
+     - else: split -> transcribe each chunk -> summarize each chunk -> write to cache
+    Returns: (audio_hash, cache_path, transcript_text, chunk_summaries_list)
+    """
+    # read bytes and compute hash
+    audio_file.stream.seek(0)
+    audio_bytes = audio_file.stream.read()
+    audio_hash = sha256_bytes(audio_bytes)
+    cache_path = make_cache_path(audio_hash)
+
+    # quick cache check for transcript + chunk summaries
+    cached_transcript = read_cache_file(cache_path, "transcript.txt")
+    cached_chunk_summaries = read_cache_file(cache_path, "chunk_summaries.json")
+    if cached_transcript is not None and cached_chunk_summaries is not None:
+        try:
+            chunk_summaries = json.loads(cached_chunk_summaries)
+        except Exception:
+            chunk_summaries = []
+        return audio_hash, cache_path, cached_transcript, chunk_summaries
+
+    # not cached or incomplete -> generate
+    # load audio into AudioSegment
+    # determine format
+    filename = getattr(audio_file, "filename", "audio")
+    ext = filename.rsplit('.', 1)[1].lower() if '.' in filename else "wav"
+    audio_segment = AudioSegment.from_file(io.BytesIO(audio_bytes), format=ext)
+
+    # split into chunks
+    chunks = split_audio_into_chunks(audio_segment, chunk_ms=CHUNK_MS)
+    model = get_gemini_model()
+
+    transcripts = []
+    summaries = []
+    for idx, chunk_bytes in enumerate(chunks):
+        # transcribe
+        t = transcribe_chunk(model, chunk_bytes, idx)
+        transcripts.append(t)
+        # small pause
+        time.sleep(TRANSCRIBE_PAUSE)
+        # summarize chunk text (safe to provide transcript as text)
+        s = summarize_chunk_text(model, t, idx)
+        summaries.append({"index": idx, "summary": s, "transcript_snippet": t[:600]})
+        time.sleep(TRANSCRIBE_PAUSE)
+
+    combined_transcript = "\n\n--- CHUNK BOUNDARY ---\n\n".join(transcripts)
+
+    # write transcript & chunk summaries to cache
+    write_cache_file(cache_path, "transcript.txt", combined_transcript)
+    write_cache_file(cache_path, "chunk_summaries.json", json.dumps(summaries, ensure_ascii=False, indent=2))
+
+    return audio_hash, cache_path, combined_transcript, summaries
+
+# ---------- Endpoints (notes / flashcards / quizzes) ----------
+
+@app.route("/generate_notes", methods=["POST"])
 def generate_notes():
-    # This route will receive the audio data (or a reference to it)
-    # and call the Gemini API for notes.
-    # For now, it's a placeholder.
-    # The actual audio data would be sent here from the frontend,
-    # or if we store it temporarily, we'd reference it.
     if 'audio' not in request.files:
         return jsonify({"error": "No audio file provided"}), 400
-
     audio_file = request.files['audio']
     filename = audio_file.filename
-
-    is_valid, error_msg = validate_audio_file(audio_file.stream, filename)
+    is_valid, err = validate_audio_file(audio_file.stream, filename)
     if not is_valid:
-        return jsonify({"error": error_msg}), 400
+        return jsonify({"error": err}), 400
 
     try:
+        audio_hash, cache_path, transcript_text, chunk_summaries = prepare_transcript_and_summaries(audio_file)
+
+        # If notes cached, return immediately
+        cached_notes = read_cache_file(cache_path, "notes.txt")
+        if cached_notes is not None:
+            return jsonify({"notes": cached_notes, "cached": True}), 200
+
+        # Build synthesis prompt using chunk summaries (safer than full transcript)
+        concatenated_chunk_summaries = "\n\n".join([f"Chunk {c['index']+1}: {c['summary']}" for c in chunk_summaries])
+
+        prompt_text = f"""
+You are an AI assistant specialized in creating detailed study notes from class content.
+Below are concise chunk-level summaries (1-3 sentences each) created from the audio transcript.
+Use them to produce:
+
+1) High-Level Overview: one short paragraph summarizing the main topics.
+2) Concept-Wise Breakdown: for each major concept, provide a heading, definition/explanation, example(s), and any formulas if present.
+3) Bullet Point Summary: the most important takeaways suitable for quick review.
+
+Chunk summaries:
+{concatenated_chunk_summaries}
+
+Produce the notes in clear English.
+"""
         model = get_gemini_model()
-        audio_content_bytes = audio_file.stream.read() # Read the content after validation
+        resp = model.generate_content([prompt_text])
+        notes_content = resp.text or ""
 
-        # Prepare the audio part for Gemini
-        audio_part = {
-            "mime_type": f"audio/{filename.rsplit('.', 1)[1].lower()}",
-            "data": audio_content_bytes
-        }
+        # cache notes
+        write_cache_file(cache_path, "notes.txt", notes_content)
 
-        # Define the prompt for notes
-        prompt_text = """
-        You are an AI assistant specialized in creating detailed study notes from class recordings.
-        Please transcribe the following audio. After transcription, generate comprehensive notes with the following structure:
-        1.  **High-Level Overview:** A concise summary of the main topics covered in the class, briefly mentioning key concepts.
-        2.  **Concept-Wise Breakdown:** For each major concept discussed, provide a more detailed explanation, including definitions, relevant examples, and any formulas mentioned. Organize this clearly under concept headings.
-        3.  **Bullet Point Summary:** A concise list of the most important takeaways and key points, suitable for quick review.
+        return jsonify({"notes": notes_content, "cached": False}), 200
 
-        Example of desired output structure:
-        ---
-        [High-Level Overview]
-        Class covered the newton's laws of motion. 1st law: ... 2nd law: ... 3rd law: ...
-        
-        [Concept-Wise Breakdown]
-        **Newton's First Law of Motion (Law of Inertia)**
-        Definition: ...
-        Explanation: ...
-        Example: ...
-        Formula/Principle: ...
-
-        **Newton's Second Law of Motion**
-        Definition: ...
-        Explanation: ...
-        Example: ...
-        Formula: F = ma (where F is force, m is mass, a is acceleration)
-        
-        **Newton's Third Law of Motion**
-        Definition: ...
-        Explanation: ...
-        Example: ...
-        Principle: ...
-        
-        [Bullet Point Summary]
-        - Newton's Laws of Motion:
-        - 1st Law: definition, example, principle of inertia.
-        - 2nd Law: definition, example, F=ma.
-        - 3rd Law: definition, example, action-reaction pairs.
-        ---
-        Ensure all output is in English, even if the speaker has an accent.
-        """
-        # Note: The actual prompt should be more detailed, like the example I gave earlier.
-        # This is a concise version for initial testing.
-
-        # Send both text prompt and audio to Gemini Pro Vision
-        response = model.generate_content([prompt_text, audio_part])
-
-        # Extract the text response
-        notes_content = response.text
-
-        return jsonify({"notes": notes_content}), 200
-
-    except genai.types.BlockedPromptException as e:
-        return jsonify({"error": f"Content generation blocked due to safety policy: {e.response.prompt_feedback}"}), 400
     except Exception as e:
-        # Catch other potential Gemini errors or network issues
         return jsonify({"error": f"Failed to generate notes: {str(e)}"}), 500
 
-
-@app.route('/generate_flashcards', methods=['POST'])
+@app.route("/generate_flashcards", methods=["POST"])
 def generate_flashcards():
     if 'audio' not in request.files:
         return jsonify({"error": "No audio file provided"}), 400
-
     audio_file = request.files['audio']
     filename = audio_file.filename
-
-    is_valid, error_msg = validate_audio_file(audio_file.stream, filename)
+    is_valid, err = validate_audio_file(audio_file.stream, filename)
     if not is_valid:
-        return jsonify({"error": error_msg}), 400
+        return jsonify({"error": err}), 400
 
     try:
+        audio_hash, cache_path, transcript_text, chunk_summaries = prepare_transcript_and_summaries(audio_file)
+
+        cached_flashcards = read_cache_file(cache_path, "flashcards.json")
+        if cached_flashcards is not None:
+            return jsonify({"flashcards": json.loads(cached_flashcards), "cached": True}), 200
+
+        # Use chunk summaries as input to generate flashcards
+        concatenated_chunk_summaries = "\n\n".join([f"Chunk {c['index']+1}: {c['summary']}" for c in chunk_summaries])
+        prompt_text = f"""
+You are an AI assistant that makes study flashcards from class content. Use the chunk summaries below to identify 3-10 good flashcards.
+Format strictly as JSON array of objects: [{{"front":"...","back":"..."}}], where 'front' is a concise prompt/question and 'back' is the concise answer/explanation.
+
+Chunk summaries:
+{concatenated_chunk_summaries}
+"""
         model = get_gemini_model()
-        audio_content_bytes = audio_file.stream.read()
+        resp = model.generate_content([prompt_text])
+        flashcards_text = resp.text or ""
 
-        audio_part = {
-            "mime_type": f"audio/{filename.rsplit('.', 1)[1].lower()}",
-            "data": audio_content_bytes
-        }
+        # strip code block if needed
+        if flashcards_text.strip().startswith("```json"):
+            flashcards_text = flashcards_text.strip().lstrip("```json").rstrip("```").strip()
 
-        # Define the prompt for flashcards
-        prompt_text = """
-        You are an AI assistant specialized in creating study flashcards from class content.
-        Please transcribe the following audio. From the transcribed content, identify 1 to 3 key concepts and/or formulas suitable for flashcards. For each flashcard, provide:
-        -   **Front:** The concept or formula itself.
-        -   **Back:** A clear, concise explanation or definition of the concept/formula.
-        Focus on a mix of important concepts and formulas.
-        
-        Provide the output in a structured JSON format, where each object represents a flashcard:
-        [
-            {
-                "front": "Concept/Formula Name",
-                "back": "Explanation/Definition"
-            },
-            {
-                "front": "Concept/Formula Name 2",
-                "back": "Explanation/Definition 2"
-            }
-        ]
-        """
-
-        response = model.generate_content([prompt_text, audio_part])
-        flashcards_json_string = response.text
-
-        # Gemini might sometimes include markdown code block syntax (```json)
-        # We need to strip it to get pure JSON
-        if flashcards_json_string.strip().startswith('```json'):
-            flashcards_json_string = flashcards_json_string.strip()[len('```json'):]
-            if flashcards_json_string.strip().endswith('```'):
-                flashcards_json_string = flashcards_json_string.strip()[:-len('```')]
-
-        import json
-        flashcards_data = json.loads(flashcards_json_string)
-
-        return jsonify({"flashcards": flashcards_data}), 200
+        flashcards_data = json.loads(flashcards_text)
+        write_cache_file(cache_path, "flashcards.json", json.dumps(flashcards_data, ensure_ascii=False, indent=2))
+        return jsonify({"flashcards": flashcards_data, "cached": False}), 200
 
     except json.JSONDecodeError:
         return jsonify({"error": "Gemini returned invalid JSON for flashcards. Please try again."}), 500
-    except genai.types.BlockedPromptException as e:
-        return jsonify({"error": f"Content generation blocked due to safety policy: {e.response.prompt_feedback}"}), 400
     except Exception as e:
         return jsonify({"error": f"Failed to generate flashcards: {str(e)}"}), 500
 
-
-@app.route('/generate_quizzes', methods=['POST'])
+@app.route("/generate_quizzes", methods=["POST"])
 def generate_quizzes():
     if 'audio' not in request.files:
         return jsonify({"error": "No audio file provided"}), 400
-
     audio_file = request.files['audio']
     filename = audio_file.filename
-
-    is_valid, error_msg = validate_audio_file(audio_file.stream, filename)
+    is_valid, err = validate_audio_file(audio_file.stream, filename)
     if not is_valid:
-        return jsonify({"error": error_msg}), 400
+        return jsonify({"error": err}), 400
 
     try:
+        audio_hash, cache_path, transcript_text, chunk_summaries = prepare_transcript_and_summaries(audio_file)
+
+        cached_quiz = read_cache_file(cache_path, "quiz.json")
+        if cached_quiz is not None:
+            return jsonify({"quiz": json.loads(cached_quiz), "cached": True}), 200
+
+        concatenated_chunk_summaries = "\n\n".join([f"Chunk {c['index']+1}: {c['summary']}" for c in chunk_summaries])
+        prompt_text = f"""
+You are an AI assistant specialized in generating multiple-choice quiz questions from class content.
+From the chunk summaries below, create exactly 5 multiple-choice questions (MCQs). For each question:
+ - Provide the question text.
+ - Provide 4 possible answer choices labeled A, B, C, D (only one correct).
+ - Indicate the correct choice with the 'correct_answer' field.
+
+Format output as strict JSON array of objects.
+
+Chunk summaries:
+{concatenated_chunk_summaries}
+"""
         model = get_gemini_model()
-        audio_content_bytes = audio_file.stream.read()
+        resp = model.generate_content([prompt_text])
+        quiz_text = resp.text or ""
 
-        audio_part = {
-            "mime_type": f"audio/{filename.rsplit('.', 1)[1].lower()}",
-            "data": audio_content_bytes
-        }
+        if quiz_text.strip().startswith("```json"):
+            quiz_text = quiz_text.strip().lstrip("```json").rstrip("```").strip()
 
-        # Define the prompt for quizzes
-        prompt_text = """
-        You are an AI assistant specialized in generating multiple-choice quiz questions from class content.
-        Please transcribe the following audio. From the transcribed content, create exactly 3 multiple-choice questions (MCQs) for general understanding. For each question:
-        -   Provide the question itself.
-        -   Provide 4 possible answer choices (A, B, C, D), where only one is correct.
-        -   Clearly indicate the correct answer.
-
-        Example of desired output structure (JSON format):
-        [
-            {
-                "question": "What is the primary definition of Newton's First Law of Motion?",
-                "options": {
-                    "A": "Force equals mass times acceleration.",
-                    "B": "For every action, there is an equal and opposite reaction.",
-                    "C": "An object at rest stays at rest, and an object in motion stays in motion with the same speed and in the same direction unless acted upon by an unbalanced force.",
-                    "D": "Energy cannot be created or destroyed."
-                },
-                "correct_answer": "C"
-            }
-        ]
-        Ensure the questions are at a general understanding difficulty level.
-        """
-
-        response = model.generate_content([prompt_text, audio_part])
-        quiz_json_string = response.text
-
-        # Strip markdown code block syntax if present
-        if quiz_json_string.strip().startswith('```json'):
-            quiz_json_string = quiz_json_string.strip()[len('```json'):]
-            if quiz_json_string.strip().endswith('```'):
-                quiz_json_string = quiz_json_string.strip()[:-len('```')]
-
-        import json
-        quiz_data = json.loads(quiz_json_string)
-
-        return jsonify({"quiz": quiz_data}), 200
+        quiz_data = json.loads(quiz_text)
+        write_cache_file(cache_path, "quiz.json", json.dumps(quiz_data, ensure_ascii=False, indent=2))
+        return jsonify({"quiz": quiz_data, "cached": False}), 200
 
     except json.JSONDecodeError:
         return jsonify({"error": "Gemini returned invalid JSON for quizzes. Please try again."}), 500
-    except genai.types.BlockedPromptException as e:
-        return jsonify({"error": f"Content generation blocked due to safety policy: {e.response.prompt_feedback}"}), 400
     except Exception as e:
         return jsonify({"error": f"Failed to generate quizzes: {str(e)}"}), 500
 
+# Basic health/status
+@app.route("/health", methods=["GET"])
+def health():
+    return jsonify({"status": "ok"}), 200
 
-# --- Run the Flask App ---
-if __name__ == '__main__':
-    # For development, Flask defaults to port 5000.
-    # debug=True allows for auto-reloading on code changes.
+if __name__ == "__main__":
     app.run(debug=True, port=5000)
