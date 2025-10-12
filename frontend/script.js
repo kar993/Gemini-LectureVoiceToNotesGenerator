@@ -1,6 +1,7 @@
 // --- Configuration ---
 const BACKEND_URL = 'http://127.0.0.1:5000'; // Our Flask backend URL
-const ESTIMATED_PROCESSING_TIME_SECONDS = 60 * 2; // Approx 2 minutes for a 15 min audio, adjust as needed
+const MAX_AUDIO_SECONDS = 60 * 60; // 60 minutes in seconds
+const ESTIMATED_PROCESSING_TIME_SECONDS = 60 * 8; // Approx 8 minutes for a 60 min audio (adjust as needed)
 
 // --- DOM Element Caching ---
 const dropArea = document.getElementById('drop-area');
@@ -110,6 +111,7 @@ function disableControlButtons() {
 
 /**
  * Handles the selected file and updates UI.
+ * Also performs a client-side duration check using an Audio element.
  */
 function handleFile(file) {
     if (file) {
@@ -123,10 +125,48 @@ function handleFile(file) {
             return;
         }
 
-        uploadedAudioFile = file;
-        fileNameDisplay.textContent = `Selected file: ${file.name}`;
-        enableControlButtons();
-        notesOutput.classList.add('hidden'); // Hide notes if new file uploaded
+        // Client-side duration check: create an audio element and load metadata
+        const objectUrl = URL.createObjectURL(file);
+        const audioEl = new Audio();
+        audioEl.src = objectUrl;
+        audioEl.preload = 'metadata';
+
+        audioEl.addEventListener('loadedmetadata', () => {
+            const duration = audioEl.duration; // in seconds (may be NaN if not available)
+            URL.revokeObjectURL(objectUrl);
+            if (!isFinite(duration)) {
+                // fallback: allow it but warn user
+                uploadedAudioFile = file;
+                fileNameDisplay.textContent = `Selected file: ${file.name}`;
+                enableControlButtons();
+                notesOutput.classList.add('hidden');
+                showModal('Warning', 'Could not determine audio duration in the browser. Server will validate when uploading.');
+                return;
+            }
+
+            if (duration > MAX_AUDIO_SECONDS) {
+                showModal('File Too Long', `Uploaded audio is ${Math.floor(duration/60)} minutes and ${Math.floor(duration%60)} seconds — the maximum allowed is 60 minutes.`);
+                uploadedAudioFile = null;
+                fileNameDisplay.textContent = '';
+                disableControlButtons();
+                return;
+            }
+
+            // All good
+            uploadedAudioFile = file;
+            fileNameDisplay.textContent = `Selected file: ${file.name} (${Math.floor(duration/60)}m ${Math.floor(duration%60)}s)`;
+            enableControlButtons();
+            notesOutput.classList.add('hidden'); // Hide notes if new file uploaded
+        });
+
+        audioEl.addEventListener('error', (e) => {
+            URL.revokeObjectURL(objectUrl);
+            showModal('Error', 'Could not read audio metadata in the browser. The server will validate the file when uploaded.');
+            uploadedAudioFile = file;
+            fileNameDisplay.textContent = `Selected file: ${file.name}`;
+            enableControlButtons();
+        });
+
     } else {
         uploadedAudioFile = null;
         fileNameDisplay.textContent = '';
@@ -189,26 +229,170 @@ async function generateFlashcards() {
         flashcardsData = data.flashcards;
         if (flashcardsData.length > 0) {
             currentFlashcardIndex = 0;
-            displayFlashcard();
+            // show modal first, then inject content so it doesn't get wiped
             showModal('Generated Flashcards', 'Click the card to flip!', '', true);
+            displayFlashcard();
         } else {
             showModal('No Flashcards', 'Gemini could not generate any flashcards from the audio.');
         }
     }
 }
 
+// --- Restore generateQuizzes (was missing) ---
 async function generateQuizzes() {
     const data = await sendAudioToBackend('/generate_quizzes');
     if (data && data.quiz) {
         quizData = data.quiz;
-        if (quizData.length > 0) {
+
+        // Helpful debug output (open DevTools Console to inspect the raw shape)
+        console.log("QUIZ DATA RAW:", quizData);
+
+        if (Array.isArray(quizData) && quizData.length > 0) {
             currentQuizQuestionIndex = 0;
-            displayQuizQuestion();
             showModal('Generated Quiz', 'Answer the questions below.', '', true);
+            displayQuizQuestion();
         } else {
             showModal('No Quiz', 'Gemini could not generate any quiz questions from the audio.');
         }
     }
+}
+
+// Robust, single displayQuizQuestion implementation (accepts various shapes)
+function displayQuizQuestion() {
+    if (!Array.isArray(quizData) || quizData.length === 0) return;
+
+    const raw = quizData[currentQuizQuestionIndex] || {};
+
+    // Normalize various possible fields to a consistent shape
+    const questionText = raw.question || raw.prompt || raw.q || "Untitled question";
+
+    // optionsObj will be a mapping like { "A": "choice text", "B": "choice text", ... }
+    let optionsObj = {};
+    let correctLetter = raw.correct_answer || raw.correct || null;
+
+    // Case A: options is an object, e.g. { A: "...", B: "..." }
+    if (raw.options && typeof raw.options === 'object' && !Array.isArray(raw.options)) {
+        optionsObj = raw.options;
+    }
+    // Case B: options is an array -> convert to A, B, C...
+    else if (Array.isArray(raw.options) && raw.options.length > 0) {
+        const letters = ['A','B','C','D','E','F','G','H'];
+        raw.options.forEach((opt, idx) => {
+            optionsObj[letters[idx] || String(idx+1)] = opt;
+        });
+    }
+
+    // Case C: choices may be an object ({A:..}) or array [...]
+    if (!raw.options && raw.choices) {
+        if (typeof raw.choices === 'object' && !Array.isArray(raw.choices)) {
+            // choices is an object mapping letters -> text
+            optionsObj = raw.choices;
+        } else if (Array.isArray(raw.choices) && raw.choices.length > 0) {
+            const letters = ['A','B','C','D','E','F','G','H'];
+            raw.choices.forEach((opt, idx) => {
+                optionsObj[letters[idx] || String(idx+1)] = opt;
+            });
+        }
+    }
+
+    // Case D: answers array variant
+    if (!raw.options && !raw.choices && Array.isArray(raw.answers) && raw.answers.length > 0) {
+        const letters = ['A','B','C','D','E','F','G','H'];
+        raw.answers.forEach((opt, idx) => {
+            optionsObj[letters[idx] || String(idx+1)] = opt;
+        });
+    }
+
+    // If the model provided an index for the correct answer, convert it to a letter
+    if ((raw.answer_index !== undefined || raw.correct_index !== undefined) && !correctLetter) {
+        const idx = (raw.answer_index !== undefined) ? raw.answer_index : raw.correct_index;
+        const letters = ['A','B','C','D','E','F','G','H'];
+        if (typeof idx === 'number' && idx >= 0) {
+            correctLetter = letters[idx] || String(idx+1);
+        }
+    }
+
+    // If the model provided correct_text, try to find a matching option
+    if (!correctLetter && raw.correct_text) {
+        for (const [k, v] of Object.entries(optionsObj)) {
+            if (v && raw.correct_text && v.trim().toLowerCase() === raw.correct_text.trim().toLowerCase()) {
+                correctLetter = k;
+                break;
+            }
+        }
+    }
+
+    // Build HTML for options
+    let optionsHtml = '';
+    const optionKeys = Object.keys(optionsObj);
+    if (optionKeys.length === 0) {
+        optionsHtml = `<p><em>No answer choices were returned for this question.</em></p>`;
+    } else {
+        for (const key of optionKeys) {
+            const labelText = optionsObj[key];
+            optionsHtml += `
+                <label>
+                    <input type="radio" name="quiz-option" value="${escapeHtml(key)}">
+                    ${escapeHtml(key)}. ${escapeHtml(labelText)}
+                </label>
+            `;
+        }
+    }
+
+    // Render modal content
+    modalMessage.textContent = `Question ${currentQuizQuestionIndex + 1} of ${quizData.length}`;
+    modalBodyContent.innerHTML = `
+        <div class="quiz-question-container">
+            <p>${escapeHtml(questionText)}</p>
+            <div class="quiz-options">
+                ${optionsHtml}
+            </div>
+            <button id="submit-answer-btn" class="submit-button">Submit Answer</button>
+            <div id="quiz-feedback-area" class="quiz-feedback"></div>
+        </div>
+    `;
+
+    // Hook up submit button behavior
+    const submitBtn = document.getElementById('submit-answer-btn');
+    const feedbackArea = document.getElementById('quiz-feedback-area');
+
+    submitBtn.onclick = function() {
+        const selectedOption = document.querySelector('input[name="quiz-option"]:checked');
+        if (!selectedOption) {
+            feedbackArea.textContent = 'Please select an answer.';
+            feedbackArea.className = 'quiz-feedback';
+            return;
+        }
+
+        const userAnswer = selectedOption.value;
+
+        if (correctLetter && userAnswer === correctLetter) {
+            feedbackArea.textContent = 'Correct!';
+            feedbackArea.className = 'quiz-feedback correct';
+        } else if (correctLetter) {
+            feedbackArea.textContent = `Incorrect! Correct: ${correctLetter}.`;
+            feedbackArea.className = 'quiz-feedback incorrect';
+        } else {
+            feedbackArea.textContent = 'Answer recorded.';
+            feedbackArea.className = 'quiz-feedback';
+        }
+
+        submitBtn.disabled = true;
+        document.querySelectorAll('input[name="quiz-option"]').forEach(input => input.disabled = true);
+    };
+
+    updateModalNavigation();
+}
+
+// Helper to escape HTML to avoid accidental injection
+function escapeHtml(str) {
+    if (str === undefined || str === null) return '';
+    return String(str)
+        .replaceAll('&', '&amp;')
+        .replaceAll('<', '&lt;')
+        .replaceAll('>', '&gt;')
+        .replaceAll('"', '&quot;')
+        .replaceAll("'", '&#39;');
 }
 
 // --- Interactive Display Functions (Modal Content) ---
@@ -223,73 +407,22 @@ function displayFlashcard() {
         <div class="flashcard-container">
             <div class="flashcard" id="current-flashcard">
                 <div class="flashcard-face flashcard-front">
-                    <div class="flashcard-content">${flashcard.front}</div>
+                    <div class="flashcard-content">${escapeHtml(flashcard.front)}</div>
                 </div>
                 <div class="flashcard-face flashcard-back">
-                    <div class="flashcard-content">${flashcard.back}</div>
+                    <div class="flashcard-content">${escapeHtml(flashcard.back)}</div>
                 </div>
             </div>
         </div>
     `;
 
     // Add event listener to flip card
-    document.getElementById('current-flashcard').onclick = function() {
-        this.classList.toggle('flipped');
-    };
-
-    updateModalNavigation();
-}
-
-function displayQuizQuestion() {
-    if (quizData.length === 0) return;
-
-    const question = quizData[currentQuizQuestionIndex];
-    modalMessage.textContent = `Question ${currentQuizQuestionIndex + 1} of ${quizData.length}`;
-
-    let optionsHtml = '';
-    for (const key in question.options) {
-        optionsHtml += `
-            <label>
-                <input type="radio" name="quiz-option" value="${key}">
-                ${key}. ${question.options[key]}
-            </label>
-        `;
+    const el = document.getElementById('current-flashcard');
+    if (el) {
+        el.onclick = function() {
+            this.classList.toggle('flipped');
+        };
     }
-
-    modalBodyContent.innerHTML = `
-        <div class="quiz-question-container">
-            <p>${question.question}</p>
-            <div class="quiz-options">
-                ${optionsHtml}
-            </div>
-            <button id="submit-answer-btn" class="submit-button">Submit Answer</button>
-            <div id="quiz-feedback-area" class="quiz-feedback"></div>
-        </div>
-    `;
-
-    const submitBtn = document.getElementById('submit-answer-btn');
-    const feedbackArea = document.getElementById('quiz-feedback-area');
-
-    submitBtn.onclick = function() {
-        const selectedOption = document.querySelector('input[name="quiz-option"]:checked');
-        if (!selectedOption) {
-            feedbackArea.textContent = 'Please select an answer.';
-            feedbackArea.className = 'quiz-feedback'; // Reset for warnings
-            return;
-        }
-
-        const userAnswer = selectedOption.value;
-        if (userAnswer === question.correct_answer) {
-            feedbackArea.textContent = 'Correct!';
-            feedbackArea.className = 'quiz-feedback correct';
-        } else {
-            feedbackArea.textContent = 'Incorrect! Please review this concept.';
-            feedbackArea.className = 'quiz-feedback incorrect';
-        }
-        submitBtn.disabled = true; // Prevent re-submission
-        // Optionally, highlight correct answer or disable other options
-        document.querySelectorAll('input[name="quiz-option"]').forEach(input => input.disabled = true);
-    };
 
     updateModalNavigation();
 }
@@ -400,7 +533,6 @@ nextBtn.addEventListener('click', () => {
         }
     }
 });
-
 
 // --- Initial Setup ---
 disableControlButtons(); // Buttons are disabled until a file is uploaded
