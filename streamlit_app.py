@@ -276,35 +276,64 @@ st.markdown(
 )
 
 # file uploader (store content into session_state so it survives reruns)
+# ---- Upload handling (persist uploaded file to disk + session_state) ----
 uploaded = st.file_uploader("Upload MP3/WAV lecture (≤ {} min)".format(MAX_ALLOWED_MINUTES), type=["mp3", "wav"])
 
-# If a fresh upload happened, read bytes and store them in session_state
+# Ensure cache dir exists
+CACHE_DIR.mkdir(parents=True, exist_ok=True)
+
+def save_uploaded_to_disk(uploaded_file):
+    """Save uploaded file bytes to a deterministic temp path and return path."""
+    uploaded_file.seek(0)
+    b = uploaded_file.read()
+    h = hashlib.sha256(b).hexdigest()[:12]
+    ext = (uploaded_file.name.rsplit(".", 1)[-1]).lower()
+    tmp_name = f"uploaded_{h}.{ext}"
+    tmp_path = CACHE_DIR / tmp_name
+    # write only if missing (avoid re-writing)
+    if not tmp_path.exists():
+        tmp_path.write_bytes(b)
+    return str(tmp_path), len(b)
+
+# If a fresh upload happened, write it to disk and store path in session_state
 if uploaded is not None:
     try:
-        uploaded_bytes = uploaded.read()
-        st.session_state['uploaded_bytes'] = uploaded_bytes
+        path, size_bytes = save_uploaded_to_disk(uploaded)
+        st.session_state['uploaded_path'] = path
         st.session_state['uploaded_name'] = uploaded.name
-        st.success(f"Loaded file: {uploaded.name}")
+        st.success(f"Saved file: {uploaded.name} ({size_bytes/1024/1024:.1f} MB)")
     except Exception as e:
-        st.error(f"Failed to read uploaded file: {e}")
+        st.error(f"Failed to save uploaded file: {e}")
 
-# If session_state already has uploaded file, use it
-uploaded_bytes = st.session_state.get('uploaded_bytes', None)
+# If we already had an uploaded path in session, use that
+uploaded_path = st.session_state.get('uploaded_path', None)
 uploaded_name = st.session_state.get('uploaded_name', None)
+uploaded_bytes = None
+if uploaded_path:
+    try:
+        uploaded_bytes = Path(uploaded_path).read_bytes()
+    except Exception as e:
+        st.error(f"Could not read persisted upload at {uploaded_path}: {e}")
+        # clear session state so user can reupload
+        st.session_state.pop('uploaded_path', None)
+        st.session_state.pop('uploaded_name', None)
+        uploaded_bytes = None
 
-# show file info and validate (but don't block UI creation)
+# show info
 if uploaded_bytes:
     ok, dur_or_err = validate_audio_bytes(uploaded_bytes, uploaded_name)
     if not ok:
         st.error(dur_or_err)
-        # if invalid, clear the session state so user can reupload
-        st.session_state.pop('uploaded_bytes', None)
+        # remove bad upload
+        st.session_state.pop('uploaded_path', None)
         st.session_state.pop('uploaded_name', None)
         uploaded_bytes = None
-        uploaded_name = None
     else:
         minutes = dur_or_err / 60.0
         st.info(f"File OK — {uploaded_name} — duration {minutes:.2f} minutes")
+else:
+    st.info("No audio file loaded. Upload a file to enable generation buttons.")
+
 
 # Session UI elements for progress and status
 progress_bar = st.progress(0)
