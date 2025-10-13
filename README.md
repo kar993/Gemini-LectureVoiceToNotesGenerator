@@ -1,7 +1,9 @@
 # Gemini-LectureVoiceToNotesGenerator
 An AI powered webapp that takes lecture/class audio recordings and turns them into study aids
 
-Upload an audio file (format: MP3 and WAV only and duration: 15 mins maximum for now) and choose:
+**Make sure ffmpeg is installed in your system**
+
+Upload an audio file (format: MP3 and WAV only and duration: 60mins) and choose:
 1. Generate Notes - For concise summary of the lecture
 2. Generate Flashcards - Concept/explanation style cards for revision
 3. Generate Quizzes - Practice MCQs to test understanding
